@@ -31,6 +31,7 @@ export async function GET() {
       )
     `)
         .eq("is_live", true)
+        .is("ended_at", null)
         .order("started_at", { ascending: false });
 
     if (error) {

@@ -57,50 +57,94 @@ export const pollPlatformAccounts = inngest.createFunction(
                 is_live: false,
                 raw: {},
             };
+            const isLive = !!snap.is_live;
 
-            // open session?
+            // CANONICAL CHECK: Open session means ended_at is null
             const { data: open } = await db
                 .from("live_sessions")
                 .select("id")
                 .eq("platform_account_id", a.id)
-                .eq("is_live", true)
+                .is("ended_at", null)
                 .maybeSingle();
 
             const wasLive = !!open?.id;
-            const isLive = !!snap.is_live;
+            let outcome = "no_change";
 
-            if (!wasLive && isLive) {
-                await db.from("status_events").insert({
-                    platform_account_id: a.id,
-                    event_type: "went_live",
-                    payload: snap.raw as any ?? {},
-                });
+            try {
+                // CASE A: NEW SESSION (Was Offline -> Now Live)
+                if (!wasLive && isLive) {
+                    await db.from("status_events").insert({
+                        platform_account_id: a.id,
+                        event_type: "went_live",
+                        payload: snap.raw as any ?? {},
+                    });
 
-                await db.from("live_sessions").insert({
-                    platform_account_id: a.id,
-                    is_live: true,
-                    started_at: snap.started_at ?? new Date().toISOString(),
-                    title: snap.title ?? null,
-                    category: snap.category ?? null,
-                    viewer_count: snap.viewer_count ?? null,
-                    stream_url: snap.stream_url ?? null,
-                    thumbnail_url: snap.thumbnail_url ?? null,
-                    raw: snap.raw as any ?? {},
-                });
+                    await db.from("live_sessions").insert({
+                        platform_account_id: a.id,
+                        is_live: true,
+                        started_at: snap.started_at ?? new Date().toISOString(),
+                        ended_at: null, // Explicitly null
+                        title: snap.title ?? null,
+                        category: snap.category ?? null,
+                        viewer_count: snap.viewer_count ?? null,
+                        stream_url: snap.stream_url ?? null,
+                        thumbnail_url: snap.thumbnail_url ?? null,
+                        raw: snap.raw as any ?? {},
+                    });
+                    outcome = "created_session";
+                }
+
+                // CASE B: END SESSION (Was Live -> Now Offline)
+                if (wasLive && !isLive) {
+                    await db.from("status_events").insert({
+                        platform_account_id: a.id,
+                        event_type: "went_offline",
+                        payload: snap.raw as any ?? {},
+                    });
+
+                    // Canonical Close: ended_at = NOW, is_live = FALSE
+                    await db
+                        .from("live_sessions")
+                        .update({ is_live: false, ended_at: new Date().toISOString() })
+                        .eq("id", open!.id);
+
+                    outcome = "closed_session";
+                }
+
+                // CASE C: UPDATE EXISTING (Was Live -> Still Live)
+                if (wasLive && isLive) {
+                    await db
+                        .from("live_sessions")
+                        .update({
+                            viewer_count: snap.viewer_count ?? null,
+                            title: snap.title ?? null,
+                            updated_at: new Date().toISOString()
+                        })
+                        .eq("id", open!.id);
+
+                    outcome = "updated_session";
+                }
+
+            } catch (err: any) {
+                // Idempotency Handler: If race condition (unique violation), we lost the race.
+                // This means another worker inserted the session. Treat as success.
+                if (err?.code === "23505" || err?.message?.includes("one_open_session_per_platform_account")) {
+                    console.warn(`[Poll] Race condition handled for ${a.platform}/${a.platform_username}`);
+                    outcome = "race_lost_refetched";
+                } else {
+                    throw err; // Real error
+                }
             }
 
-            if (wasLive && !isLive) {
-                await db.from("status_events").insert({
-                    platform_account_id: a.id,
-                    event_type: "went_offline",
-                    payload: snap.raw as any ?? {},
-                });
-
-                await db
-                    .from("live_sessions")
-                    .update({ is_live: false, ended_at: new Date().toISOString() })
-                    .eq("id", open!.id);
-            }
+            // Structured Log "Proof of Life"
+            console.log(JSON.stringify({
+                event: "poll_account_result",
+                platform: a.platform,
+                username: a.platform_username,
+                outcome,
+                is_live: isLive,
+                latency_ms: 0 // placeholder
+            }));
 
             // next check: fast if live, slow if offline (jittered)
             const nextSeconds = isLive ? jitterSeconds(30, 10) : jitterSeconds(90, 30);
